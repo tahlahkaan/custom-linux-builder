@@ -29,6 +29,7 @@ readonly VOLUME_LABEL="CustomLinux"    # Volume label for the ISO
 # These are tracked so cleanup() can safely unmount them on exit.
 ISO_MOUNT_DIR=""
 ROOTFS_DIR=""
+SQUASHFS_PATH=""
 
 # ============================================================
 # HELPER FUNCTIONS
@@ -132,12 +133,20 @@ enter_chroot() {
     # --------------------------------------------------------
 
     log "Entering chroot. Type 'exit' to leave."
-    sudo chroot "$ROOTFS_DIR" bash
+    # "|| true": if the last command you ran inside chroot exits non-zero,
+    # that becomes this line's exit status. Without "|| true", set -e would
+    # abort the whole script right here and skip the unmounts below.
+    sudo chroot "$ROOTFS_DIR" bash || true
 
     log "Unmounting chroot directories..."
-    sudo umount "$ROOTFS_DIR/dev"
-    sudo umount "$ROOTFS_DIR/proc"
-    sudo umount "$ROOTFS_DIR/sys"
+    # /dev, /proc, /sys MUST be unmounted before repacking — otherwise
+    # mksquashfs would bake live device nodes and /proc entries from this
+    # machine into the new image. "-R" catches any nested mounts a package
+    # manager may have created inside them; "|| true" keeps a busy mount
+    # from aborting the script (cleanup() below is the final safety net).
+    sudo umount -R "$ROOTFS_DIR/dev" 2>/dev/null || true
+    sudo umount -R "$ROOTFS_DIR/proc" 2>/dev/null || true
+    sudo umount -R "$ROOTFS_DIR/sys" 2>/dev/null || true
 }
 
 # ============================================================
@@ -158,13 +167,36 @@ repack_rootfs() {
 # 5. BUILD THE NEW ISO
 # ============================================================
 build_iso() {
+    log "Reading the original ISO's boot configuration..."
+    # Instead of guessing where isolinux/GRUB/EFI files live (which breaks
+    # on distros that use a different layout), ask xorriso to read the
+    # source ISO's actual El Torito boot record and hand back the exact
+    # mkisofs-equivalent options needed to reproduce it. This works
+    # regardless of directory naming conventions across distros, and
+    # correctly reproduces BIOS-only, UEFI-only, or hybrid boot setups.
+    local boot_opts_file="$BUILD_DIR/boot_opts.txt"
+    # Drop the original ISO's own -V line — otherwise it would override our
+    # VOLUME_LABEL setting, since it appears later on the command line.
+    xorriso -indev "$SOURCE_ISO" -report_el_torito as_mkisofs 2>/dev/null \
+        | grep '^-' | grep -v "^-V " > "$boot_opts_file" || true
+
     log "Building new ISO: $OUTPUT_ISO"
-    sudo xorriso -as mkisofs \
-        -o "$OUTPUT_ISO" \
-        -V "$VOLUME_LABEL" \
-        -r -J \
-        "$BUILD_DIR/iso/"
-    sudo chown "$USER" "$OUTPUT_ISO"
+    if [ -s "$boot_opts_file" ]; then
+        log "Reproducing the original boot record (BIOS/UEFI as applicable)"
+        # printf %q shell-escapes VOLUME_LABEL safely (handles spaces and
+        # quotes) before it goes through eval — the earlier version wrapped
+        # it in a literal "'...'" instead, which broke on labels with spaces.
+        local esc_label
+        printf -v esc_label '%q' "$VOLUME_LABEL"
+        # shellcheck disable=SC2046,SC2086
+        eval sudo xorriso -as mkisofs -o "$OUTPUT_ISO" -V "$esc_label" -r -J \
+            "$(tr '\n' ' ' < "$boot_opts_file")" \
+            "$BUILD_DIR/iso/"
+    else
+        log "Source ISO has no El Torito boot record; building a data-only ISO"
+        sudo xorriso -as mkisofs -o "$OUTPUT_ISO" -V "$VOLUME_LABEL" -r -J "$BUILD_DIR/iso/"
+    fi
+    sudo chown "${SUDO_USER:-$USER}" "$OUTPUT_ISO"
     log "Done: $OUTPUT_ISO"
 }
 
