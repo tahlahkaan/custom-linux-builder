@@ -19,7 +19,7 @@
 set -euo pipefail
 
 # ============================================================
-# CONFIGURATION (forkers should edit this section first)
+# CONFIGURATION
 # ============================================================
 readonly SOURCE_ISO="${1:-}"          # Input ISO path (first argument)
 readonly BUILD_DIR="./build"           # Working directory
@@ -46,8 +46,15 @@ die() {
 
 # Runs no matter how the script exits (success, error, Ctrl+C) and
 # safely unmounts anything that might still be mounted.
+# IMPROVEMENT: Added /run and /tmp to the cleanup list for modern systems.
 cleanup() {
     log "Cleaning up..."
+    if [ -n "$ROOTFS_DIR" ] && mountpoint -q "$ROOTFS_DIR/run" 2>/dev/null; then
+        sudo umount -R "$ROOTFS_DIR/run" 2>/dev/null || true
+    fi
+    if [ -n "$ROOTFS_DIR" ] && mountpoint -q "$ROOTFS_DIR/tmp" 2>/dev/null; then
+        sudo umount -R "$ROOTFS_DIR/tmp" 2>/dev/null || true
+    fi
     if [ -n "$ROOTFS_DIR" ] && mountpoint -q "$ROOTFS_DIR/dev" 2>/dev/null; then
         sudo umount -R "$ROOTFS_DIR/dev" 2>/dev/null || true
     fi
@@ -79,6 +86,15 @@ check_input() {
 }
 
 # ============================================================
+# IMPROVED: Detect the original compression algorithm of the squashfs.
+# Uses awk instead of grep -P for maximum POSIX portability.
+# ============================================================
+get_original_comp() {
+    local squashfs="$1"
+    unsquashfs -s "$squashfs" 2>/dev/null | awk -F': *' '/Compression/ {print $2; exit}'
+}
+
+# ============================================================
 # 1. EXTRACT THE ISO AND COPY ITS FILES
 # ============================================================
 extract_iso() {
@@ -94,11 +110,37 @@ extract_iso() {
 }
 
 # ============================================================
-# 2. LOCATE AND UNPACK THE SQUASHFS (to access the root filesystem)
+# 2. LOCATE AND UNPACK THE SQUASHFS
+# IMPROVEMENT: Extended search paths for Fedora, Arch, openSUSE,
+# Gentoo, Alpine, and other major distributions.
 # ============================================================
 extract_rootfs() {
     log "Looking for the root filesystem (squashfs)..."
-    SQUASHFS_PATH="$(find "$BUILD_DIR/iso" \( -name "*.squashfs" -o -name "squashfs.img" \) -print -quit)"
+
+    # Common distribution paths (Ubuntu, Debian, Fedora, Arch, openSUSE, Gentoo, Alpine, etc.)
+    local possible_paths=(
+        "$BUILD_DIR/iso/casper/filesystem.squashfs"          # Ubuntu / Debian
+        "$BUILD_DIR/iso/live/filesystem.squashfs"            # Debian Live
+        "$BUILD_DIR/iso/LiveOS/squashfs.img"                 # Fedora / RHEL
+        "$BUILD_DIR/iso/images/rootfs.img"                   # Arch Linux (iso)
+        "$BUILD_DIR/iso/rootfs.squashfs"                     # Alpine / NixOS
+        "$BUILD_DIR/iso/system.squashfs"                     # openSUSE
+        "$BUILD_DIR/iso/livecd.squashfs"                     # Gentoo
+        "$BUILD_DIR/iso/rootfs.img"                          # Custom minimal ISOs
+        "$BUILD_DIR/iso/filesystem.squashfs"                 # Generic path
+    )
+    SQUASHFS_PATH=""
+    for p in "${possible_paths[@]}"; do
+        if [ -f "$p" ]; then
+            SQUASHFS_PATH="$p"
+            break
+        fi
+    done
+
+    # If none found, fallback to a generic find (head -1 is POSIX-safe)
+    if [ -z "$SQUASHFS_PATH" ]; then
+        SQUASHFS_PATH="$(find "$BUILD_DIR/iso" \( -name "*.squashfs" -o -name "squashfs.img" -o -name "rootfs.img" \) | head -1)"
+    fi
 
     ROOTFS_DIR="$BUILD_DIR/rootfs"
 
@@ -113,37 +155,29 @@ extract_rootfs() {
 }
 
 # ============================================================
-# 3. PREPARE THE CHROOT ENVIRONMENT AND OPEN IT FOR CUSTOMIZATION
+# 3. PREPARE THE CHROOT ENVIRONMENT
+# IMPROVEMENT: Bind /run and /tmp for modern init systems (systemd, snap, flatpak).
+# Also ensures the target directories exist inside the chroot.
 # ============================================================
 enter_chroot() {
     log "Binding system directories for chroot..."
+
+    # Ensure target mount points exist inside the chroot
+    sudo mkdir -p "$ROOTFS_DIR/dev" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/sys" "$ROOTFS_DIR/run" "$ROOTFS_DIR/tmp"
+
     sudo mount --bind /dev "$ROOTFS_DIR/dev"
     sudo mount --bind /proc "$ROOTFS_DIR/proc"
     sudo mount --bind /sys "$ROOTFS_DIR/sys"
-
-    # --------------------------------------------------------
-    # CUSTOMIZATION AREA
-    # Forkers can add their own automated setup commands in the
-    # block below. Example:
-    #
-    #   sudo chroot "$ROOTFS_DIR" bash -c '
-    #       apt update
-    #       apt install -y neofetch
-    #   '
-    # --------------------------------------------------------
+    sudo mount --bind /run "$ROOTFS_DIR/run"
+    sudo mount --bind /tmp "$ROOTFS_DIR/tmp"
 
     log "Entering chroot. Type 'exit' to leave."
-    # "|| true": if the last command you ran inside chroot exits non-zero,
-    # that becomes this line's exit status. Without "|| true", set -e would
-    # abort the whole script right here and skip the unmounts below.
     sudo chroot "$ROOTFS_DIR" bash || true
 
     log "Unmounting chroot directories..."
-    # /dev, /proc, /sys MUST be unmounted before repacking — otherwise
-    # mksquashfs would bake live device nodes and /proc entries from this
-    # machine into the new image. "-R" catches any nested mounts a package
-    # manager may have created inside them; "|| true" keeps a busy mount
-    # from aborting the script (cleanup() below is the final safety net).
+    # Unmount in reverse order
+    sudo umount -R "$ROOTFS_DIR/tmp" 2>/dev/null || true
+    sudo umount -R "$ROOTFS_DIR/run" 2>/dev/null || true
     sudo umount -R "$ROOTFS_DIR/dev" 2>/dev/null || true
     sudo umount -R "$ROOTFS_DIR/proc" 2>/dev/null || true
     sudo umount -R "$ROOTFS_DIR/sys" 2>/dev/null || true
@@ -151,11 +185,31 @@ enter_chroot() {
 
 # ============================================================
 # 4. REPACK THE MODIFIED ROOT FILESYSTEM
+# IMPROVEMENT: Uses the original compression algorithm dynamically.
+# If the original is unknown or unsupported by the local system,
+# it safely falls back to "gzip" (the most universally supported).
 # ============================================================
 repack_rootfs() {
     if [ -n "$SQUASHFS_PATH" ]; then
         log "Rebuilding squashfs..."
-        sudo mksquashfs "$ROOTFS_DIR" "$SQUASHFS_PATH.new" -comp zstd -noappend
+
+        local comp
+        comp=$(get_original_comp "$SQUASHFS_PATH")
+
+        # Fallback to gzip if detection fails (gzip is universally supported)
+        if [ -z "$comp" ]; then
+            comp="gzip"
+            log "Could not detect original compression, using gzip as fallback."
+        else
+            log "Detected compression: $comp"
+            # Verify that the current mksquashfs supports this algorithm
+            if ! mksquashfs -comp help 2>/dev/null | grep -q "\b$comp\b"; then
+                log "WARNING: $comp is not supported by this mksquashfs. Falling back to gzip."
+                comp="gzip"
+            fi
+        fi
+
+        sudo mksquashfs "$ROOTFS_DIR" "$SQUASHFS_PATH.new" -comp "$comp" -noappend
         sudo mv "$SQUASHFS_PATH.new" "$SQUASHFS_PATH"
     else
         log "Copying changes back into the ISO folder..."
@@ -168,24 +222,13 @@ repack_rootfs() {
 # ============================================================
 build_iso() {
     log "Reading the original ISO's boot configuration..."
-    # Instead of guessing where isolinux/GRUB/EFI files live (which breaks
-    # on distros that use a different layout), ask xorriso to read the
-    # source ISO's actual El Torito boot record and hand back the exact
-    # mkisofs-equivalent options needed to reproduce it. This works
-    # regardless of directory naming conventions across distros, and
-    # correctly reproduces BIOS-only, UEFI-only, or hybrid boot setups.
     local boot_opts_file="$BUILD_DIR/boot_opts.txt"
-    # Drop the original ISO's own -V line — otherwise it would override our
-    # VOLUME_LABEL setting, since it appears later on the command line.
     xorriso -indev "$SOURCE_ISO" -report_el_torito as_mkisofs 2>/dev/null \
         | grep '^-' | grep -v "^-V " > "$boot_opts_file" || true
 
     log "Building new ISO: $OUTPUT_ISO"
     if [ -s "$boot_opts_file" ]; then
         log "Reproducing the original boot record (BIOS/UEFI as applicable)"
-        # printf %q shell-escapes VOLUME_LABEL safely (handles spaces and
-        # quotes) before it goes through eval — the earlier version wrapped
-        # it in a literal "'...'" instead, which broke on labels with spaces.
         local esc_label
         printf -v esc_label '%q' "$VOLUME_LABEL"
         # shellcheck disable=SC2046,SC2086
