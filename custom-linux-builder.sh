@@ -15,15 +15,20 @@
 # - Minimal, clear changes only — no extra complexity.
 #
 # Usage:
-#   sudo ./custom-linux-builder.sh /path/to/original.iso [--output out.iso] [--label LABEL] [--workdir ./build]
-#   Optional flags:
-#     --no-chroot       Don't drop into interactive chroot (useful with --run-script).
-#     --run-script PATH Copy and execute PATH inside the chroot (non-interactive customization).
-#     --keep-build      Don't remove the build directory after completion.
-#     --help            Show this help and exit.
+#   sudo ./custom-linux-builder.sh /path/to/original.iso --output /path/to/output.iso [--label LABEL] [--workdir ./build]
+#
+# Notes:
+# - Default mode is non-interactive (no chroot). Provide --run-script to apply customizations inside the chroot.
+# - This script now requires the --output parameter so you explicitly name the generated ISO.
+#
+# Optional flags:
+#   --no-chroot       Don't drop into interactive chroot (default behavior).
+#   --run-script PATH Copy and execute PATH inside the chroot (non-interactive customization).
+#   --keep-build      Keep the build directory after completion (default: keep for debugging).
+#   --help            Show this help and exit.
 #
 # Requirements (on Debian/Ubuntu-based systems):
-#   sudo apt install squashfs-tools xorriso rsync file
+#   sudo apt install squashfs-tools xorriso rsync file coreutils
 #
 # WARNING: This script performs loop-mount and chroot operations on
 # your system. Make sure you understand the code before running it.
@@ -35,13 +40,13 @@ set -euo pipefail
 # ============================================================
 # DEFAULT CONFIGURATION
 # ============================================================
-SOURCE_ISO=""                    # Input ISO path (positional or set by --source)
+SOURCE_ISO=""                    # Input ISO path (positional)
 BUILD_DIR="./build"               # Working directory
-OUTPUT_ISO="./custom.iso"         # Output ISO file
+OUTPUT_ISO=""                     # Output ISO file (required)
 VOLUME_LABEL="CustomLinux"        # Volume label for the ISO
-NO_CHROOT=0                        # If set, skip interactive chroot
+NO_CHROOT=1                        # Default: non-interactive mode
 RUN_SCRIPT=""                     # Script on host to copy into chroot and run
-KEEP_BUILD=0                       # If set, keep build directory after completion
+KEEP_BUILD=1                       # Default: keep build directory for inspection
 
 # Tracked so cleanup() can safely unmount them on exit.
 ISO_MOUNT_DIR=""
@@ -63,19 +68,19 @@ die() {
 
 usage() {
     cat <<EOF
-Usage: $0 [options] /path/to/original.iso
+Usage: $0 [options] /path/to/original.iso --output /path/to/output.iso
 Options:
-  --output PATH     Output ISO (default: $OUTPUT_ISO)
+  --output PATH     Output ISO (required)
   --label LABEL     Volume label for the ISO (default: $VOLUME_LABEL)
   --workdir DIR     Working directory (default: $BUILD_DIR)
-  --no-chroot       Don't drop into interactive chroot (use with --run-script)
+  --no-chroot       Don't drop into interactive chroot (default)
   --run-script PATH Copy and execute PATH inside the chroot (non-interactive)
-  --keep-build      Keep the build directory after completion
+  --keep-build      Keep the build directory after completion (default)
   --help            Show this help and exit
 
 Examples:
-  sudo $0 ./ubuntu.iso --output my-custom.iso --label MyUbuntu
-  sudo $0 ./arch.iso --run-script ./customize.sh --no-chroot
+  sudo $0 ./ubuntu.iso --output ./my-ubuntu-custom.iso --label MyUbuntu
+  sudo $0 ./arch.iso --output ./arch-custom.iso --run-script ./customize.sh
 EOF
     exit 1
 }
@@ -114,7 +119,6 @@ cleanup() {
 
     # Optionally remove build dir unless KEEP_BUILD is set
     if [ "$KEEP_BUILD" -eq 0 ] && [ -n "${BUILD_DIR:-}" ] && [ -d "$BUILD_DIR" ]; then
-        # Keep the build directory for inspection if requested
         rm -rf "$BUILD_DIR" 2>/dev/null || true
     fi
 }
@@ -122,17 +126,18 @@ trap cleanup EXIT
 
 check_dependencies() {
     local missing=()
-    for cmd in unsquashfs mksquashfs xorriso rsync file; do
+    for cmd in unsquashfs mksquashfs xorriso rsync file sha256sum; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
     done
     if [ ${#missing[@]} -gt 0 ]; then
-        die "Missing commands: ${missing[*]}. Install with 'sudo apt install squashfs-tools xorriso rsync file'."
+        die "Missing commands: ${missing[*]}. Install with 'sudo apt install squashfs-tools xorriso rsync file coreutils'."
     fi
 }
 
 check_input() {
-    [ -n "$SOURCE_ISO" ] || die "Usage: $0 <iso-path>"
+    [ -n "$SOURCE_ISO" ] || die "Usage: $0 <iso-path> --output /path/to/output.iso"
     [ -f "$SOURCE_ISO" ] || die "ISO not found: $SOURCE_ISO"
+    [ -n "$OUTPUT_ISO" ] || die "You must provide an output ISO filename with --output /path/to/output.iso"
 }
 
 # Detect the original compression algorithm of the squashfs using unsquashfs's summary
@@ -241,9 +246,13 @@ enter_chroot() {
             # Copy the script into the chroot and run it
             cp "$RUN_SCRIPT" "$ROOTFS_DIR/tmp/customizer.sh"
             chmod +x "$ROOTFS_DIR/tmp/customizer.sh"
+            # Copy resolv.conf to allow network-based package installation if needed
+            if [ -f /etc/resolv.conf ]; then
+                cp -L /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf" 2>/dev/null || true
+            fi
             chroot "$ROOTFS_DIR" /bin/bash -c "/tmp/customizer.sh; rm -f /tmp/customizer.sh" || true
         else
-            log "--no-chroot specified but no --run-script provided; skipping interactive chroot."
+            log "Non-interactive mode selected but no --run-script provided; skipping customization step."
         fi
     else
         log "Entering interactive chroot. Type 'exit' to leave."
@@ -300,6 +309,7 @@ build_iso() {
     xorriso -indev "$SOURCE_ISO" -report_el_torito as_mkisofs 2>/dev/null | grep '^-' | grep -v "^-V " > "$boot_opts_file" || true
 
     log "Building new ISO: $OUTPUT_ISO"
+    mkdir -p "$(dirname "$OUTPUT_ISO")"
     if [ -s "$boot_opts_file" ]; then
         log "Reproducing the original boot record (BIOS/UEFI as applicable)"
         local esc_label
@@ -309,6 +319,15 @@ build_iso() {
     else
         log "Source ISO has no El Torito boot record; building a data-only ISO"
         xorriso -as mkisofs -o "$OUTPUT_ISO" -V "$VOLUME_LABEL" -r -J "$BUILD_DIR/iso/"
+    fi
+
+    # Generate SHA256 for the resulting ISO
+    if command -v sha256sum >/dev/null 2>&1; then
+        log "Generating SHA256 checksum..."
+        sha256sum "$OUTPUT_ISO" > "$OUTPUT_ISO.sha256" || true
+        if [ -n "${SUDO_USER:-}" ]; then
+            chown "${SUDO_USER}" "$OUTPUT_ISO" "$OUTPUT_ISO.sha256" || true
+        fi
     fi
 
     # If script was run under sudo, set file owner back to the original user
