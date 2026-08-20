@@ -1,72 +1,140 @@
 # custom-linux-builder
 
-A small Bash script that takes the ISO of **any Linux distribution**, drops you into a `chroot` shell inside it so you can customize it, and repacks your changes into a new bootable ISO.
+A small Bash script that takes the ISO of any Linux distribution, applies customizations, and repacks your changes into a new bootable ISO.
+
+This repository provides a minimal, portable, and safe workflow for customizing live ISOs. The script aims to remain simple and reproducible so it's easy to fork and adapt for your distribution's needs.
 
 ## Features
 
-- Works with any distro that ships a standard `squashfs`-based live ISO (Debian, Ubuntu, Arch-based, etc.) and falls back to a plain file copy if there's no squashfs.
-- Interactive `chroot` session — install packages, remove them, edit configs, add branding, anything you'd normally do on a live system.
-- Cleans up after itself: all loop mounts and bind mounts are unmounted automatically, even if the script fails or is interrupted.
-- Single configuration block at the top of the file — no need to touch the rest of the script to change output name/label.
+- Supports squashfs-based live ISOs (Ubuntu/Debian/Arch/Fedora/openSUSE, etc.) and falls back to copying ISO contents when no squashfs is found.
+- Non-interactive automation support via `--run-script` (default). You can provide a script that runs inside the chroot to apply repeatable changes.
+- Keeps a build directory by default for inspection and debugging; optional `--keep-build` flag to change behavior.
+- Attempts to detect the original squashfs compression and reuse it; falls back to `gzip` if unsupported.
+- Produces a SHA256 checksum for the resulting ISO (`<output>.sha256`).
+- Simple CLI: `--output`, `--label`, `--workdir`, `--run-script`.
 
 ## Requirements
 
-Debian/Ubuntu-based systems:
+On Debian/Ubuntu-based systems, install:
 
 ```bash
-sudo apt install squashfs-tools xorriso rsync
+sudo apt install squashfs-tools xorriso rsync file coreutils
 ```
 
-You'll also need `sudo`/root access, since mounting and `chroot` require it.
+On Fedora/RHEL:
 
-## Usage
+```bash
+sudo dnf install squashfs-tools xorriso rsync file coreutils
+```
+
+You'll also need `sudo`/root access since mounting and `chroot` require it. Run the script in a disposable VM or test host.
+
+## Quick start
+
+Clone the repository and make the script executable:
 
 ```bash
 git clone https://github.com/tahlahkaan/custom-linux-builder.git
 cd custom-linux-builder
 chmod +x custom-linux-builder.sh
-
-sudo ./custom-linux-builder.sh /path/to/original.iso
 ```
 
-The script will:
-
-1. Extract the ISO's contents.
-2. Locate and unpack its squashfs root filesystem (if present).
-3. Bind-mount `/dev`, `/proc`, `/sys` and drop you into a `chroot` shell.
-4. Wait for you to type `exit` when you're done customizing.
-5. Repack the root filesystem and rebuild the ISO.
-
-The result is written to `./custom.iso` in the directory you ran the script from.
-
-## Configuration
-
-Edit the top of `custom-linux-builder.sh`:
+Create a customized ISO (non-interactive default):
 
 ```bash
-readonly BUILD_DIR="./build"           # working directory
-readonly OUTPUT_ISO="./custom.iso"     # output ISO file
-readonly VOLUME_LABEL="CustomLinux"    # volume label for the ISO
+sudo ./custom-linux-builder.sh /path/to/original.iso --output /path/to/my-custom.iso
 ```
 
-## Automating customizations
-
-If you want the script to apply the same changes every time (instead of doing them by hand in the interactive shell), add commands inside the `enter_chroot()` function, in the block marked `CUSTOMIZATION AREA`:
+Run an automation script inside the chroot:
 
 ```bash
-sudo chroot "$ROOTFS_DIR" bash -c '
-    apt update
-    apt install -y neofetch
-'
+sudo ./custom-linux-builder.sh /path/to/original.iso --output /path/to/my-custom.iso --run-script ./customize.sh
 ```
 
-## Disclaimer
+If you prefer to enter an interactive chroot, run the script and pass the appropriate flag to enable interactive mode (see `--help`).
 
-This script performs loop-mount and `chroot` operations on your system. Read and understand the code before running it. No responsibility is accepted for data loss or system issues caused by using it.
+## Automating customizations (examples)
+
+Use `--run-script` to copy a script into the chroot's `/tmp` and execute it. The script runner attempts to copy `/etc/resolv.conf` into the chroot so network package installs work in typical setups.
+
+Important: Keep the run-script minimal and idempotent — it's easier to debug and re-run.
+
+Example `customize.sh` for Ubuntu / Debian (APT):
+
+```bash
+#!/bin/bash
+set -e
+
+# Example: enable universe, update and install a package
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends neofetch
+# Perform additional configuration here
+```
+
+Example `customize.sh` for Fedora (DNF):
+
+```bash
+#!/bin/bash
+set -e
+
+# Example: update and install package on Fedora
+dnf -y upgrade
+dnf -y install neofetch
+# Perform additional configuration here
+```
+
+Notes:
+- If your distribution uses a different package manager (pacman, zypper, apk), adjust the commands accordingly.
+- The script runner copies `/etc/resolv.conf` to the chroot to help with DNS resolution, but complex networking setups might still require manual setup.
+
+## Usage: examples
+
+- Basic, non-interactive build:
+  sudo ./custom-linux-builder.sh ./ubuntu.iso --output ./ubuntu-custom.iso
+
+- Run custom script inside chroot:
+  sudo ./custom-linux-builder.sh ./ubuntu.iso --output ./ubuntu-custom.iso --run-script ./customize.sh
+
+- Keep the build directory for debugging (default behavior):
+  sudo ./custom-linux-builder.sh ./ubuntu.iso --output ./ubuntu-custom.iso --keep-build
+
+## Critical pitfalls and warnings
+
+These are important, simple safety notes you must read before using the script.
+
+- WARNING: This script performs loop mounts and chroots that modify namespaces such as `/proc`, `/sys`, and `/dev` on the host. Run it only on a disposable/test machine or inside a VM until you are confident with the changes.
+
+- WARNING: Overwriting the original squashfs can break the ISO. The script writes a `.new` file first and then replaces the original atomically, but you should keep backups of original ISOs.
+
+- WARNING: Some ISOs use unusual image layouts, signed boot configurations, or exotic compression methods. Repacking with an unsupported compression algorithm may render the ISO unbootable. Always test-boot generated ISOs in a VM before using them on hardware.
+
+- WARNING: Automated package installs inside chroot may fail without proper `/etc/resolv.conf`, mounts, or distribution-specific init scripts. The script copies `/etc/resolv.conf` when running `--run-script`, but automated customizations still need verification.
+
+- WARNING: Do NOT run this on production hosts. Mounting and bind operations can affect the host if misused.
+
+## Smoke-test (quick verification)
+
+1. Use a disposable VM or snapshot. Copy `original.iso` into the VM.
+2. Run:
+
+```bash
+sudo ./custom-linux-builder.sh original.iso --output ./custom.iso
+```
+
+3. Confirm `./custom.iso` and `./custom.iso.sha256` exist, then test-boot `custom.iso` in a VM.
+
+## Troubleshooting (common issues and fixes)
+
+- Missing dependencies: Install squashfs-tools, xorriso, rsync, file, coreutils.
+- No squashfs found: Some ISOs do not use squashfs; the script will fall back to copying the ISO contents and rebuilding a data-only ISO.
+- Unsupported compression: If the detected compression isn't supported by your `mksquashfs`, the script falls back to `gzip`. If boot fails, retry with a different approach or inspect the `mksquashfs` output in the build directory.
+- Permission errors: Ensure you run the script as root (the script automatically re-execs with `sudo` if needed).
 
 ## License
 
 This project is licensed under the **GNU General Public License v3.0** — see [LICENSE](LICENSE) for the full text.
 
-## WARNING!
-This code was generated by AI.
+## Notes about provenance
+
+This code was generated by AI and later reviewed and improved by the repository maintainer. Use with care and always test in a controlled environment.
